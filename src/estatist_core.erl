@@ -100,6 +100,7 @@ select(Names, Types, Params) ->
     F = fun({Name, var, Contexts}) ->
                 get_from_contexts(Name, Types, Params, Contexts);
            ({Name, tbl, {_, _}}) ->
+                %% There was initially nested {ok, ...} responses
                 {ok, Result} = select(Name, Types, Params, all),
                 Result
         end,
@@ -218,17 +219,28 @@ handle_call(_, _, State) ->
 handle_cast(_, State) ->
     {noreply, State}.
 
-handle_info({tick, var, Tick, ModContext = {Mod, Context}}, State) ->
-    Mod:tick(Context),
-    ok = schedule_tick(Tick, var, ModContext),
+handle_info({tick, var, Tick, Name, ModContext = {Mod, Context}}, State) ->
+    case ets:lookup(?MODULE, Name) of
+        [] ->
+            ok;
+        _ ->
+            Mod:tick(Context),
+            ok = schedule_tick(Tick, var, Name, ModContext)
+    end,
     {noreply, State};
 
-handle_info({tick, tbl, Tick, TableType = {Tid, Type}}, State) ->
-    ok = ets:foldr(fun ({_Name, Contexts}, Acc) ->
-        [Mod:tick(Context) || {Type0, Mod, Context} <- Contexts, Type0 =:= Type],
-        Acc
-    end, ok, Tid),
-    ok = schedule_tick(Tick, tbl, TableType),
+handle_info({tick, tbl, Tick, Name, TableType = {Tid, Type}}, State) ->
+    case ets:lookup(?MODULE, Name) of
+        [] ->
+            ok;
+        _ ->
+            %% The table itself is surely live since removal is now synchronized
+            ok = ets:foldl(fun ({_Name, Contexts}, Acc) ->
+                [Mod:tick(Context) || {Type0, Mod, Context} <- Contexts, Type0 =:= Type],
+                Acc
+            end, ok, Tid),
+            ok = schedule_tick(Tick, tbl, Name, TableType)
+    end,
     {noreply, State};
 
 handle_info(_, State) ->
@@ -272,10 +284,13 @@ init_metric(var, Name, MetricTypes) ->
 init_metric(tbl, Name, MetricTypes) ->
     Tid = ets:new(?MODULE, [public, set]),
     F = fun(MetricType) ->
+                %% Let us make a timer per metric instead of per metric-and-every-row.
+                %% It will certainly save us some cycles but on the other hand there is
+                %% ugly init procedure with dummy metric context.
                 Magic = make_magic_tuple(MetricType),
                 {Type, Mod, Options} = Magic,
                 {_Dummy, Tick} = Mod:init(Name, Options),
-                ok = schedule_tick(Tick, tbl, {Tid, Type}),
+                ok = schedule_tick(Tick, tbl, Name, {Tid, Type}),
                 Magic
         end,
     {Tid, lists:map(F, MetricTypes)}.
@@ -287,7 +302,7 @@ make_magic_tuple(MetricType) ->
 
 init_metric_type(Name, Mode, {MetricType, Mod, Options}) ->
     {Context, Tick} = Mod:init(Name, Options),
-    ok = schedule_tick(Tick, Mode, {Mod, Context}),
+    ok = schedule_tick(Tick, Mode, Name, {Mod, Context}),
     {MetricType, Mod, Context}.
 
 get_metric_type_module(MetricType) ->
@@ -383,15 +398,12 @@ correct_row_id_1(E, _) when is_integer(E) -> E;
 correct_row_id_1(_, List) ->
     throw({incorrect_row_id, List}).
 
-schedule_tick(undefined, _, _) ->
+schedule_tick(undefined, _, _, _) ->
     ok;
-schedule_tick(_Tick, row, _ModContext) ->
+schedule_tick(_Tick, row, _Name, _ModContext) ->
     ok;
-schedule_tick(Tick, tbl, TableType = {_, _}) ->
-    erlang:send_after(Tick, self(), {tick, tbl, Tick, TableType}),
-    ok;
-schedule_tick(Tick, var, ModContext = {_, _}) ->
-    erlang:send_after(Tick, self(), {tick, var, Tick, ModContext}),
+schedule_tick(Tick, Mode, Name, Context) when Mode =:= var orelse Mode =:= tbl ->
+    erlang:send_after(Tick, self(), {tick, Mode, Tick, Name, Context}),
     ok.
 
 -ifdef(TEST).
